@@ -3,6 +3,13 @@
 Fast & verified RAM-boot for Clova ON (Amlogic A113X) via U-Boot USB (1b8e:c003).
 Uses exact 4096-byte DWC_BLK_MAX_LEN blocks (matching Amlogic U-Boot usb_pcd.c),
 verifies start + middle + end of every uploaded image in RAM, and boots via `booti`.
+
+Uploads DTB + kernel Image + uInitrd (legacy U-Boot ramdisk image from
+build.sh: `ramboot_out/uInitrd`) and passes the initrd address to `booti`,
+so the kernel always has an /init even when Image was built by build.sh
+without an embedded initramfs (only fast_rebuild.sh sets
+CONFIG_INITRAMFS_SOURCE). If uInitrd is missing, falls back to `booti ... - ...`
+(embedded-initramfs Image only) with a warning.
 """
 import os
 import sys
@@ -24,6 +31,15 @@ REQ_TPL_STAT = 0x31
 ADDR_DTB = 0x01000000     # 16 MB (dtb_mem_addr in U-Boot env!)
 ADDR_KERNEL = 0x01080000  # 16.5 MB (loadaddr in U-Boot env!)
 ADDR_INITRD = 0x03800000  # 56 MB (safe below 0x05000000 secmon!)
+
+PATH_DTB = "stock_clova.dtb"
+PATH_KERNEL = "ramboot_out/Image"
+PATH_INITRD = "ramboot_out/uInitrd"  # legacy U-Boot ramdisk image (mkimage -T ramdisk)
+
+# U-Boot legacy image magic (0x27051956): uInitrd must start with this.
+# A raw initrd.cpio.gz (gzip magic 0x1f 0x8b) is NOT accepted here — booti
+# would misread it without an explicit ":size" suffix.
+UBOOT_IMAGE_MAGIC = b"\x27\x05\x19\x56"
 
 LIBUSB_PATHS = [
     "/opt/homebrew/lib/libusb-1.0.dylib",
@@ -136,18 +152,52 @@ def upload_and_verify(dev, path, addr):
             raise RuntimeError(f"RAM verify FAILED at +0x{off:x}! got={got.hex()} exp={exp.hex()}")
     print(f"  [VERIFY] Start, Middle, and End ({len(offsets)} offsets up to +0x{offsets[-1]:x}) 100% MATCH!", flush=True)
 
+def upload_initrd(dev):
+    """Upload uInitrd if present; return the booti initrd argument.
+
+    Returns "0x03800000" when uInitrd was uploaded, else "-" (no initrd —
+    only works if Image has an embedded initramfs from fast_rebuild.sh).
+    """
+    if not os.path.exists(PATH_INITRD):
+        print(f"[WARN] {PATH_INITRD} not found — booting WITHOUT external initrd.", flush=True)
+        print("       Only works if Image has an embedded initramfs (fast_rebuild.sh).", flush=True)
+        print("       Run build.sh first to generate ramboot_out/uInitrd.", flush=True)
+        return "-"
+    with open(PATH_INITRD, "rb") as f:
+        magic = f.read(4)
+    if magic != UBOOT_IMAGE_MAGIC:
+        raise RuntimeError(
+            f"{PATH_INITRD} is not a U-Boot legacy ramdisk image "
+            f"(magic={magic.hex()}, expected 27051956). "
+            "Did you pass initrd.cpio.gz instead of uInitrd? "
+            "Use the mkimage-built ramboot_out/uInitrd from build.sh."
+        )
+    upload_and_verify(dev, PATH_INITRD, ADDR_INITRD)
+    return f"0x{ADDR_INITRD:08x}"
+
+
 def main():
     backend = get_backend()
     dev = wait_for_device(backend, timeout_s=90)
 
-    upload_and_verify(dev, "stock_clova.dtb", ADDR_DTB)
-    upload_and_verify(dev, "ramboot_out/Image", ADDR_KERNEL)
+    # Guard: kernel must not run into the initrd region (16.5 MB + size < 56 MB).
+    kernel_size = os.path.getsize(PATH_KERNEL)
+    if ADDR_KERNEL + kernel_size >= ADDR_INITRD:
+        raise RuntimeError(
+            f"Image too large: 0x{ADDR_KERNEL:08x} + {kernel_size} bytes "
+            f"overlaps initrd at 0x{ADDR_INITRD:08x}. Rebuild a smaller Image "
+            "or move ADDR_INITRD higher (still below 0x05000000)."
+        )
+
+    upload_and_verify(dev, PATH_DTB, ADDR_DTB)
+    upload_and_verify(dev, PATH_KERNEL, ADDR_KERNEL)
+    initrd_arg = upload_initrd(dev)
 
     bulkcmd(dev, f"setenv dtb_mem_addr 0x{ADDR_DTB:x}")
     bulkcmd(dev, "setenv bootargs rdinit=/init init=/init console=ttyS0,115200 no_console_suspend earlycon=aml_uart,0xff803000")
     bulkcmd(dev, "setenv fdt_high 0x05000000")
-    print(f"\n>>> Booting via booti 0x{ADDR_KERNEL:08x} - 0x{ADDR_DTB:08x}...", flush=True)
-    bulkcmd(dev, f"booti 0x{ADDR_KERNEL:08x} - 0x{ADDR_DTB:08x}", ignore_timeout=True)
+    print(f"\n>>> Booting via booti 0x{ADDR_KERNEL:08x} {initrd_arg} 0x{ADDR_DTB:08x}...", flush=True)
+    bulkcmd(dev, f"booti 0x{ADDR_KERNEL:08x} {initrd_arg} 0x{ADDR_DTB:08x}", ignore_timeout=True)
 
 if __name__ == "__main__":
     main()
