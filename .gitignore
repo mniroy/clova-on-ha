@@ -1,0 +1,6 @@
+.venv/
+__pycache__/
+*.pyc
+gpl_onplus/
+ramboot_out/
+.DS_Store
